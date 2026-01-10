@@ -28,7 +28,7 @@ def run_solver(args, gpu_id):
     device = torch.device(f"cuda:{gpu_id}")
     
     logger = DetailedLogger(args.save_dir, gpu_id)
-    models_dir = os.path.join("knp", "models")
+    models_dir = "models"
     os.makedirs(models_dir, exist_ok=True)
     
     # 大模型

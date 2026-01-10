@@ -3,6 +3,7 @@
 # --- 硬件配置 ---
 # 80G A100: 火力全开
 export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
 mkdir -p results
@@ -18,6 +19,6 @@ python main.py \
     --num_points 24 \
     --batch_size 256 \
     --max_steps 500000 \
-    --lr 0.0003 \
+    --lr 0.003 \
     --gpus 0,1,2,3 \
     --save_dir ./results
