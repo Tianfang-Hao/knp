@@ -1,24 +1,21 @@
 #!/bin/bash
 
-# --- 硬件配置 ---
-# 80G A100: 火力全开
+# --- 配置 ---
+# 使用 4 张卡
 export CUDA_VISIBLE_DEVICES=4,5,6,7
-export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-mkdir -p results
-mkdir -p knp/models
+# 清理旧数据 (可选)
+# rm -rf results/*
 
-echo "=== 启动 PPO-ResNet (80G VRAM Edition) ==="
-echo "Batch Size: 4096 | Hidden Dim: 1024"
+echo "=== 启动训练 (DDP Mode) ==="
 
-# 注意：Batch Size 设为 4096，LR 设为 0.0003
-# 这样每次 Update 都会处理 4096 * 128 = 52万个样本
+# 注意：Batch Size 4096 是单卡数量
+# 总 Batch = 16384 (4张卡)
 python main.py \
     --dim 4 \
     --num_points 24 \
-    --batch_size 256 \
-    --max_steps 500000 \
-    --lr 0.003 \
-    --gpus 0,1,2,3 \
+    --batch_size 128 \
+    --max_steps 1000000 \
+    --lr 0.0003 \
     --save_dir ./results

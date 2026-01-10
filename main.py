@@ -1,40 +1,53 @@
 import argparse
 import os
-import torch.multiprocessing as mp
-from solver import run_solver
 import torch
+import torch.multiprocessing as mp
+from torch.distributed import init_process_group, destroy_process_group
+from solver import run_solver
+
+# === 性能优化配置 ===
+# 1. 移除全局 float64 (回退到 float32，速度提升巨大)
+# torch.set_default_dtype(torch.float64) <--- 删除或注释这行
+
+# 2. 开启 A100 TF32 加速 (MatMul 和 CuDNN)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+def ddp_setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 def main():
-    parser = argparse.ArgumentParser(description="PPO KNP Solver")
-    
-    # 几何参数
+    parser = argparse.ArgumentParser(description="PPO KNP Solver (Fast DDP)")
     parser.add_argument('--dim', type=int, default=4)
     parser.add_argument('--num_points', type=int, default=24)
-    
-    # 训练参数
-    parser.add_argument('--batch_size', type=int, default=256)
+    # 既然回到了 FP32，显存占用减半，可以尝试进一步加大 Batch
+    parser.add_argument('--batch_size', type=int, default=4096) 
     parser.add_argument('--lr', type=float, default=0.0003)
-    parser.add_argument('--max_steps', type=int, default=200000)
-    
-    # 系统参数
+    parser.add_argument('--max_steps', type=int, default=1000000)
     parser.add_argument('--save_dir', type=str, default='./results')
-    parser.add_argument('--gpus', type=str, default='0')
     
     args = parser.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     
-    gpu_list = [int(x) for x in args.gpus.split(',')]
-    visible_devices = torch.cuda.device_count()
-    print(f"检测到 {visible_devices} 个可见 GPU, 将使用: {gpu_list}")
-    
-    if len(gpu_list) > 1:
-        mp.spawn(run_wrapper, args=(args, gpu_list), nprocs=len(gpu_list))
-    else:
-        run_solver(args, gpu_list[0])
+    world_size = torch.cuda.device_count()
+    print(f"=== KNP Solver 启动 (极速版) ===")
+    print(f"GPU数量: {world_size} | 精度: Float32 (TF32 on)")
+    print(f"总并行环境数: {args.batch_size * world_size}")
 
-def run_wrapper(rank, args, gpu_list):
-    gpu_id = gpu_list[rank]
-    run_solver(args, gpu_id)
+    if world_size > 0:
+        mp.spawn(run_wrapper, args=(world_size, args), nprocs=world_size)
+    else:
+        print("错误: 未检测到 GPU")
+
+def run_wrapper(rank, world_size, args):
+    ddp_setup(rank, world_size)
+    try:
+        run_solver(rank, args)
+    finally:
+        destroy_process_group()
 
 if __name__ == '__main__':
     main()
