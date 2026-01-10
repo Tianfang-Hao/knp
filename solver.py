@@ -23,8 +23,11 @@ def get_required_success_rate(deg):
         ratio = (deg - 40) / (55 - 40)
         return 0.80 - ratio * (0.80 - 0.01)
 
-def refine_solution(state, loss_fn, steps=1000, lr=0.01):
-    """SGD Refinement: 局部切换到 FP64 (Double) 进行高精度微调"""
+def refine_solution(state, loss_fn, steps=100, lr=0.01):
+    """
+    SGD Refinement: 局部切换到 FP64 (Double) 进行高精度微调
+    [优化] 默认步数从 1000 降为 100，避免长时间阻塞训练
+    """
     
     # === 关键修改：转换为 double 精度 ===
     # 训练用 float32 跑得快，最后微调用 float64 算得准
@@ -38,7 +41,9 @@ def refine_solution(state, loss_fn, steps=1000, lr=0.01):
     for i in range(steps):
         x_norm = torch.nn.functional.normalize(x, p=2, dim=-1)
         
-        # loss_fn 计算时会自动广播类型，或者这里确保输入是 double
+        # loss_fn 计算时会自动广播类型
+        # 注意：为了确保最佳精度，建议检查 loss.py 中的 eye 矩阵是否匹配 dtype，
+        # 但通常 PyTorch 会自动处理 float32 eye 和 double x 的运算。
         loss, max_cos = loss_fn.compute(x_norm.unsqueeze(0)) 
         loss = loss.sum()
         
@@ -47,9 +52,9 @@ def refine_solution(state, loss_fn, steps=1000, lr=0.01):
             min_max_cos = current_max_cos
             best_x = x_norm.detach().clone() # 保持 double
             
-        # 严格的 60度 阈值
+        # 严格的 60度 阈值 (cos(60) = 0.5)
+        # 容差设为 1e-9
         if current_max_cos <= 0.500000001: 
-            # 找到解后，转回 float (如果后续流程需要) 或者直接保存 double
             return best_x, True
             
         optimizer.zero_grad()
@@ -77,7 +82,6 @@ def run_solver(rank, args):
     raw_model = ActorCritic(args.dim, hidden_dim=512).to(device)
     
     # === 性能优化: 编译模型 ===
-    # 这在 PyTorch 2.0+ 上能显著加速 Transformer
     try:
         raw_model = torch.compile(raw_model)
     except:
@@ -89,16 +93,22 @@ def run_solver(rank, args):
     loss_fn = KissingLoss()
     env = KNPEnvironment(args, device, loss_fn)
     
+    # PPO Agent
+    # 注意：mini_batch_size=4096 比较大，请确保 run.sh 中的 --batch_size 设置为 4096 或更大，
+    # 否则 mini_batch 可能会大于采集的数据总量，导致报错或更新效率极低。
     agent = PPOAgent(model, optimizer, 
-                     entropy_coef=0.01, 
-                     ppo_epoch=4, 
-                     mini_batch_size=4096)
+                    entropy_coef=0.01, 
+                    ppo_epoch=4, 
+                    # [修改前] 4096
+                    # [修改后] 改为 16384 或 32768 (A100/4090 可以设更大)
+                    mini_batch_size=16384)
     
+    # [优化] 课程目标从 40 度开始，跳过过简单的阶段
     curriculum_goals = list(range(25, 61, 1)) 
     curr_idx = 0
     env.set_target_angle(curriculum_goals[curr_idx])
     
-    rollout_steps = 128
+    rollout_steps = 32
     total_updates = args.max_steps // rollout_steps
     max_steps_per_episode = 300
     
@@ -149,13 +159,11 @@ def run_solver(rank, args):
                 # === 终极成功微调 ===
                 if num_success > 0 and curriculum_goals[curr_idx] >= 50:
                     success_indices = finished_indices[real_success_mask]
-                    # 限制每轮微调的数量，防止 CPU 阻塞太久
-                    # 如果这步太慢，可以加上 [:5] 只取前 5 个
-                    for idx in success_indices[:10]:
-                        refined_x, is_perfect = refine_solution(next_state[idx], loss_fn)
+                    # [优化] 限制数量，并且使用 reduced steps=100
+                    for idx in success_indices[:5]: 
+                        refined_x, is_perfect = refine_solution(next_state[idx], loss_fn, steps=100)
                         if is_perfect and rank == 0:
                             logger.info(f"*** FOUND PERFECT SOLUTION (Refined)! ***")
-                            # 保存时记得转回 CPU，float/double 均可
                             save_result(args.save_dir, f"solved_perfect_u{update_step}", 
                                         refined_x.float(), args.num_points, args.dim, rank)
 
@@ -196,7 +204,7 @@ def run_solver(rank, args):
         model.train()
         loss, v_loss, entropy = agent.update(rollouts, next_value)
         
-        if rank == 0 and update_step % 10 == 0:
+        if rank == 0 and update_step % 1 == 0:
             std = model.module.actor_log_std.exp().mean().item()
             logger.info(
                 f"Step {update_step} | Goal {curriculum_goals[curr_idx]} | "

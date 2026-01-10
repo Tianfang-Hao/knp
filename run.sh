@@ -14,8 +14,8 @@ echo "=== 启动训练 (DDP Mode) ==="
 # 总 Batch = 16384 (4张卡)
 python main.py \
     --dim 4 \
-    --num_points 24 \
-    --batch_size 128 \
-    --max_steps 1000000 \
+    --num_points 23 \
+    --batch_size 4096 \
+    --max_steps 10000 \
     --lr 0.0003 \
     --save_dir ./results

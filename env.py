@@ -25,13 +25,14 @@ class KNPEnvironment:
         
         # 1. 更新成功判定阈值
         self.target_threshold = new_threshold
+        # 硬性下限：哪怕目标再简单，也不会让阈值低于 60 度 (0.5)
+        # 这保证了物理判断的一致性
         if self.target_threshold < 0.5: self.target_threshold = 0.5
             
         # 2. 同步更新 Loss 函数的阈值
         self.loss_fn.threshold = self.target_threshold
         
-        # === 3. 关键修复: 立即重算 last_loss ===
-        # 否则升级瞬间 loss 会暴涨，导致 Agent 收到巨大的负奖励而崩盘
+        # 3. 立即重算 last_loss，防止 Reward 震荡
         if self.state is not None:
             with torch.no_grad():
                 loss_vec, _ = self.loss_fn.compute(self.state)
@@ -76,6 +77,11 @@ class KNPEnvironment:
         # 基础奖励：势能下降
         reward = (self.last_loss - current_loss_vec) * 100.0
         
+        # [优化] 增加针对最大冲突的直接惩罚
+        # 不管当前的 Curriculum 目标是多少，始终对任何小于 60 度 (cos > 0.5) 的重叠进行惩罚
+        # 这迫使 Agent 优先解决最糟糕的拥挤区域
+        reward -= (max_cos_vec - 0.5).clamp(min=0) * 10.0
+        
         # 成功判定
         is_success = (max_cos_vec <= self.target_threshold)
         
@@ -84,9 +90,8 @@ class KNPEnvironment:
         bonus = 50.0 + 150.0 * difficulty_factor
         reward += is_success.float() * bonus
         
-        # 惩罚不动 (仅当没有成功时惩罚，防止成功后微调被惩罚)
+        # 惩罚不动 (仅当没有成功时惩罚)
         move_dist = torch.norm(action, dim=-1).mean(dim=-1)
-        # 如果已经成功了，就不需要动了，所以 mask 掉惩罚
         not_done_mask = (~is_success).float()
         reward -= 0.1 * (move_dist < 1e-6).float() * not_done_mask
 
