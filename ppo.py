@@ -19,7 +19,6 @@ class PPOAgent:
         """
         last_value_prediction: (Batch,) 最后一个状态的价值估计，用于 GAE Bootstrap
         """
-        # 1. 整理数据
         states = torch.stack([r['state'] for r in rollouts]) 
         actions = torch.stack([r['action'] for r in rollouts])
         old_log_probs = torch.stack([r['log_prob'] for r in rollouts]).detach()
@@ -27,17 +26,18 @@ class PPOAgent:
         old_values = torch.stack([r['value'] for r in rollouts]).squeeze(-1).detach()
         masks = torch.stack([r['mask'] for r in rollouts])
 
-        # 2. GAE 计算 (修正版)
+        # === GAE 计算 (完全修正版) ===
         advantages = torch.zeros_like(rewards)
         last_gae_lam = 0
         
         for t in reversed(range(len(rollouts))):
             if t == len(rollouts) - 1:
-                next_non_terminal = 1.0
-                next_value = last_value_prediction # 使用传入的真实 Next Value
+                next_value = last_value_prediction
             else:
-                next_non_terminal = masks[t+1]
                 next_value = old_values[t+1]
+            
+            # [关键修复] 使用当前时刻 t 的 mask
+            next_non_terminal = masks[t]
             
             delta = rewards[t] + self.gamma * next_value * next_non_terminal - old_values[t]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
@@ -46,14 +46,14 @@ class PPOAgent:
         returns = advantages + old_values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        # 3. Flatten
+        # Flatten
         flat_states = states.view(-1, *states.shape[2:])
         flat_actions = actions.view(-1, *actions.shape[2:])
         flat_log_probs = old_log_probs.view(-1)
         flat_returns = returns.view(-1)
         flat_advantages = advantages.view(-1)
         
-        # 4. PPO Update Loop
+        # PPO Update Loop
         total_samples = flat_states.size(0)
         total_actor_loss = 0
         total_value_loss = 0
@@ -65,6 +65,8 @@ class PPOAgent:
             
             for start in range(0, total_samples, self.mini_batch_size):
                 end = start + self.mini_batch_size
+                if end > total_samples: end = total_samples
+                
                 mb_idx = indices[start:end]
                 
                 mb_states = flat_states[mb_idx]
