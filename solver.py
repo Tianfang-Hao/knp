@@ -23,8 +23,10 @@ def get_required_success_rate(deg):
         ratio = (deg - 40) / (55 - 40)
         return 0.80 - ratio * (0.80 - 0.01)
 
-def refine_solution(state, loss_fn, steps=100, lr=0.01):
-    """SGD Refinement: 局部切换到 FP64 (Double) 进行高精度微调"""
+def refine_solution(state, _, steps=100, lr=0.01):
+    """SGD Refinement: 强制使用最终目标 (60度) 进行高精度微调"""
+    target_loss_fn = KissingLoss(target_angle_deg=60.0)
+    
     x = state.clone().detach().double().requires_grad_(True)
     optimizer = torch.optim.SGD([x], lr=lr, momentum=0.9)
     best_x = None
@@ -32,7 +34,7 @@ def refine_solution(state, loss_fn, steps=100, lr=0.01):
     
     for i in range(steps):
         x_norm = torch.nn.functional.normalize(x, p=2, dim=-1)
-        loss, max_cos = loss_fn.compute(x_norm.unsqueeze(0)) 
+        loss, max_cos = target_loss_fn.compute(x_norm.unsqueeze(0)) 
         loss = loss.sum()
         
         current_max_cos = max_cos.item()
@@ -53,49 +55,57 @@ def refine_solution(state, loss_fn, steps=100, lr=0.01):
     return best_x, (min_max_cos <= 0.5000001)
 
 def run_sft(rank, args, model, optimizer, device, logger):
-    """SFT 预训练阶段"""
+    """SFT 改良版：行为克隆 (Behavior Cloning)"""
     if args.sft_steps <= 0: return
     sft_target = args.sft_target_deg
     if rank == 0:
-        logger.info(f"=== 启动 SFT 预训练 (Steps: {args.sft_steps}, Target: {sft_target}°) ===")
+        logger.info(f"=== 启动 SFT (行为克隆模式) | Steps: {args.sft_steps} | Target: {sft_target}° ===")
     
     sft_loss_fn = KissingLoss(target_angle_deg=sft_target)
     model.train()
     t0 = time.time()
     
+    state = torch.randn(args.batch_size, args.num_points, args.dim, device=device)
+    state = normalize_sphere(state)
+    
     for step in range(args.sft_steps):
-        state = torch.randn(args.batch_size, args.num_points, args.dim, device=device)
-        state = normalize_sphere(state)
+        state.requires_grad_(True)
+        loss_physics, max_cos_vec = sft_loss_fn.compute(state)
+        grad_sum = loss_physics.sum()
+        grad_x = torch.autograd.grad(grad_sum, state)[0]
+        state.requires_grad_(False)
+        
+        grad_norm = torch.norm(grad_x, dim=-1, keepdim=True) + 1e-8
+        target_dir = -grad_x / grad_norm
+        target_action = target_dir * 0.1 
         
         dist, value = model(state)
-        action = dist.loc 
+        pred_action = dist.loc 
         
-        action_clipped = torch.clamp(action, -0.2, 0.2)
-        next_state = normalize_sphere(state + action_clipped)
-        
-        loss_vec, max_cos_vec = sft_loss_fn.compute(next_state)
-        loss = loss_vec.mean()
-        
-        # DDP Hack: 防止 unused parameters 报错
-        loss += 0.0 * value.sum() + 0.0 * dist.scale.sum()
+        loss_bc = torch.nn.functional.mse_loss(pred_action, target_action)
+        loss_bc += 0.0 * value.sum() + 0.0 * dist.scale.sum()
         
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        loss_bc.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
+        with torch.no_grad():
+            state = normalize_sphere(state + target_action)
+            
+        if step % 500 == 0 and step > 0:
+            state = torch.randn(args.batch_size, args.num_points, args.dim, device=device)
+            state = normalize_sphere(state)
+
         if rank == 0 and step % 200 == 0:
             avg_cos = max_cos_vec.mean().item()
             avg_deg = math.degrees(math.acos(min(avg_cos, 1.0)))
-            logger.info(f"[SFT] Step {step:4d} | Loss {loss.item():.4f} | Avg MaxConf {avg_deg:.1f}°")
+            logger.info(f"[SFT-BC] Step {step:4d} | MSE Loss {loss_bc.item():.6f} | Physics Conf {avg_deg:.1f}°")
 
-    # === [关键修复] 重置优化器 ===
-    # SFT 的动量对 RL 来说是噪声，必须清除，否则 RL 初期会跑偏
-    if rank == 0: logger.info(">>> 重置 Optimizer 状态，准备进入 RL...")
+    if rank == 0: logger.info(">>> SFT 完成，重置 Optimizer 并降低噪声...")
     optimizer.state.clear()
-    
-    if rank == 0:
-        logger.info(f"=== SFT 完成 (耗时 {time.time()-t0:.1f}s)，切换至 RL 模式 ===")
+    with torch.no_grad():
+        model.module.actor_log_std.fill_(-3.0)
 
 def run_solver(rank, args):
     seed = int(time.time()) + rank * 10000 
@@ -126,7 +136,7 @@ def run_solver(rank, args):
     # 2. PPO Init
     rollout_steps = 32
     total_buffer_size = args.batch_size * rollout_steps
-    calculated_mini_batch = total_buffer_size // 4 
+    calculated_mini_batch = 4096 
     
     if rank == 0:
         logger.info(f"PPO Configuration: Buffer {total_buffer_size} | MiniBatch {calculated_mini_batch}")
@@ -139,6 +149,15 @@ def run_solver(rank, args):
     # 3. RL Loop
     curriculum_goals = list(range(25, 61, 1)) 
     curr_idx = 0
+    
+    # [优化] 自动跳过过于简单的课程，从接近 SFT 目标的难度开始
+    if args.sft_steps > 0:
+        start_goal = max(25, args.sft_target_deg - 5.0)
+        for i, g in enumerate(curriculum_goals):
+            if g >= start_goal:
+                curr_idx = i
+                break
+    
     env.set_target_angle(curriculum_goals[curr_idx])
     
     total_updates = args.max_steps // rollout_steps
@@ -152,6 +171,15 @@ def run_solver(rank, args):
         logger.info(f"--- RL 初始目标: {curriculum_goals[curr_idx]} 度 ---")
     
     for update_step in range(total_updates):
+        # === Warmup 判断 ===
+        is_warmup = (update_step < 100)
+        
+        if rank == 0:
+            if update_step == 0:
+                logger.info("[Warmup] Freezing Actor parameters (via Zero-Grad). Training ONLY Critic for 100 steps...")
+            elif update_step == 100:
+                logger.info("[Warmup] Warmup done. Full PPO training starts...")
+
         model.eval()
         rollouts = []
         batch_finished = torch.tensor(0.0, device=device)
@@ -169,10 +197,7 @@ def run_solver(rank, args):
             is_timeout = (env_steps_count >= max_steps_per_episode)
             finished_mask = done | is_timeout
             
-            # === [关键修复] Timeout Mask ===
-            # 如果超时 (is_timeout)，虽然环境 reset 了，但这属于截断。
-            # 这里的 mask 设为 0，防止 GAE 用 reset 后的新状态价值去 Bootstrap 旧状态，这会导致价值估计严重偏差。
-            mask = 1.0 - finished_mask.float() 
+            mask = 1.0 - done.float() 
             
             rollouts.append({
                 'state': state, 'action': action, 'log_prob': log_prob,
@@ -218,7 +243,7 @@ def run_solver(rank, args):
             current_rate = (level_success / level_finished).item()
             
         required_rate = get_required_success_rate(curriculum_goals[curr_idx])
-        if level_finished >= 10000:
+        if level_finished >= 20000:
             if current_rate >= required_rate:
                 if curr_idx < len(curriculum_goals) - 1:
                     curr_idx += 1
@@ -230,11 +255,18 @@ def run_solver(rank, args):
             level_success.zero_()
         
         model.train()
-        loss, v_loss, entropy = agent.update(rollouts, next_value)
         
+        # === 调用 PPO Update (带 Warmup 参数) ===
+        # 如果 is_warmup 为 True，则 update_actor 为 False，Actor 梯度为 0
+        with torch.no_grad():
+            _, next_value = model(state)
+            next_value = next_value.squeeze(-1)
+
+        # 2. 传递 next_value 给 update 函数
+        # 注意：如果你保留了之前提到的 update_actor 参数，这里也需要根据情况传递
+        loss, v_loss, entropy = agent.update(rollouts, next_value)
         if rank == 0 and update_step % 1 == 0:
             std = model.module.actor_log_std.exp().mean().item()
-            # [新增] 打印 ValLoss
             logger.info(
                 f"Step {update_step} | Goal {curriculum_goals[curr_idx]} | Rate {current_rate*100:.1f}% | "
                 f"ActLoss {loss:.3f} | ValLoss {v_loss:.3f} | Ent {entropy:.2f} | Std {std:.3f}"

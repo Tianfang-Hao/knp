@@ -1,26 +1,26 @@
 #!/bin/bash
 
-# --- 配置 ---
-# 使用 4 张卡 (请根据实际情况调整)
+# --- 硬件配置 ---
+# 物理卡 4,5,6,7 -> 逻辑卡 0,1,2,3
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# 清理旧数据 (可选)
-# rm -rf results/*
+# 创建必要的目录
+mkdir -p results
+mkdir -p models
 
-echo "=== 启动训练 (DDP Mode: SFT + RL) ==="
-
-# 注意：
-# 1. --batch_size 是单卡 Batch
-# 2. --sft_steps 2000: 先进行 2000 步监督微调
-# 3. --sft_target_deg 50: SFT 阶段尝试将球推开到至少 50 度
+# --- 实验配置 ---
+# 4D, 24球 (经典问题)
+# Batch=256: 既然是 A100，开大 Batch 增加采样效率
+echo "=== 启动 PPO 课程学习求解器 ==="
+echo "目标: 从 40度 逐步训练至 60度"
+echo "模型保存路径: knp/models/"
 
 python main.py \
     --dim 4 \
-    --num_points 23 \
-    --batch_size 4096 \
-    --max_steps 10000 \
-    --lr 0.0003 \
-    --sft_steps 2000 \
-    --sft_target_deg 50.0 \
+    --num_points 24 \
+    --batch_size 2048 \
+    --max_steps 200000 \
+    --lr 0.0001 \
     --save_dir ./results
+    # --gpus 0,1,2,3,4,5,6,7 \

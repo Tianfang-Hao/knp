@@ -15,10 +15,7 @@ class PPOAgent:
         self.ppo_epoch = ppo_epoch
         self.mini_batch_size = mini_batch_size
 
-    def update(self, rollouts, last_value_prediction):
-        """
-        last_value_prediction: (Batch,) 最后一个状态的价值估计，用于 GAE Bootstrap
-        """
+    def update(self, rollouts, last_value_prediction, update_actor=True):
         states = torch.stack([r['state'] for r in rollouts]) 
         actions = torch.stack([r['action'] for r in rollouts])
         old_log_probs = torch.stack([r['log_prob'] for r in rollouts]).detach()
@@ -26,7 +23,7 @@ class PPOAgent:
         old_values = torch.stack([r['value'] for r in rollouts]).squeeze(-1).detach()
         masks = torch.stack([r['mask'] for r in rollouts])
 
-        # === GAE 计算 (完全修正版) ===
+        # === GAE 计算 ===
         advantages = torch.zeros_like(rewards)
         last_gae_lam = 0
         
@@ -36,7 +33,6 @@ class PPOAgent:
             else:
                 next_value = old_values[t+1]
             
-            # [关键修复] 使用当前时刻 t 的 mask
             next_non_terminal = masks[t]
             
             delta = rewards[t] + self.gamma * next_value * next_non_terminal - old_values[t]
@@ -52,6 +48,8 @@ class PPOAgent:
         flat_log_probs = old_log_probs.view(-1)
         flat_returns = returns.view(-1)
         flat_advantages = advantages.view(-1)
+        # [新增] Flatten old_values 用于 Value Clipping
+        flat_old_values = old_values.view(-1)
         
         # PPO Update Loop
         total_samples = flat_states.size(0)
@@ -74,6 +72,8 @@ class PPOAgent:
                 mb_old_log_probs = flat_log_probs[mb_idx]
                 mb_advantages = flat_advantages[mb_idx]
                 mb_returns = flat_returns[mb_idx]
+                # [新增] 获取对应的旧 Value
+                mb_old_values = flat_old_values[mb_idx]
                 
                 dist, values = self.model(mb_states)
                 values = values.squeeze(-1)
@@ -85,8 +85,21 @@ class PPOAgent:
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * mb_advantages
                 
                 actor_loss = -torch.min(surr1, surr2).mean()
-                value_loss = 0.5 * (mb_returns - values).pow(2).mean()
+                
+                # === [修改] Value Loss Clipping ===
+                # 限制 Value 更新幅度，防止 Loss 爆炸
+                v_pred = values
+                v_pred_clipped = mb_old_values + torch.clamp(v_pred - mb_old_values, -self.clip_param, self.clip_param)
+                
+                v_loss1 = (v_pred - mb_returns).pow(2)
+                v_loss2 = (v_pred_clipped - mb_returns).pow(2)
+                value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+                
                 entropy = dist.entropy().mean()
+                
+                if not update_actor:
+                    actor_loss = actor_loss * 0.0
+                    entropy = entropy * 0.0
                 
                 loss = actor_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
                 
