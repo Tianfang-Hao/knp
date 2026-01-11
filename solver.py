@@ -5,7 +5,6 @@ import os
 import math
 from datetime import datetime
 
-# DDP & Distributed
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import all_reduce, ReduceOp
 
@@ -17,15 +16,15 @@ from logger import DetailedLogger
 from utils import save_result, normalize_sphere
 
 def get_required_success_rate(deg):
-    if deg <= 40: return 0.80  
-    elif deg >= 55: return 0.01
+    if deg <= 40: return 0.85 
+    elif deg >= 55: return 0.005
     else:
         ratio = (deg - 40) / (55 - 40)
-        return 0.80 - ratio * (0.80 - 0.01)
+        return 0.85 - ratio * (0.85 - 0.005)
 
-def refine_solution(state, _, steps=100, lr=0.01):
-    """SGD Refinement: 强制使用最终目标 (60度) 进行高精度微调"""
-    target_loss_fn = KissingLoss(target_angle_deg=60.0)
+def refine_solution(state, loss_fn, steps=200, lr=0.01):
+    """SGD Refinement: 强制使用最终目标 (60度/0.5) 进行微调"""
+    final_threshold = 0.5 
     
     x = state.clone().detach().double().requires_grad_(True)
     optimizer = torch.optim.SGD([x], lr=lr, momentum=0.9)
@@ -34,13 +33,13 @@ def refine_solution(state, _, steps=100, lr=0.01):
     
     for i in range(steps):
         x_norm = torch.nn.functional.normalize(x, p=2, dim=-1)
-        loss, max_cos = target_loss_fn.compute(x_norm.unsqueeze(0)) 
+        loss, max_cos = loss_fn.compute(x_norm.unsqueeze(0), threshold=final_threshold)
         loss = loss.sum()
         
         current_max_cos = max_cos.item()
         if current_max_cos < min_max_cos:
             min_max_cos = current_max_cos
-            best_x = x_norm.detach().clone()
+            best_x = x_norm.detach().clone().float()
             
         if current_max_cos <= 0.500000001: 
             return best_x, True
@@ -49,28 +48,26 @@ def refine_solution(state, _, steps=100, lr=0.01):
         loss.backward()
         optimizer.step()
         
-        with torch.no_grad():
-            x.data = torch.nn.functional.normalize(x.data, p=2, dim=-1)
-            
     return best_x, (min_max_cos <= 0.5000001)
 
 def run_sft(rank, args, model, optimizer, device, logger):
-    """SFT 改良版：行为克隆 (Behavior Cloning)"""
+    """SFT (Behavior Cloning)"""
     if args.sft_steps <= 0: return
     sft_target = args.sft_target_deg
     if rank == 0:
-        logger.info(f"=== 启动 SFT (行为克隆模式) | Steps: {args.sft_steps} | Target: {sft_target}° ===")
+        logger.info(f"=== 启动 SFT | Steps: {args.sft_steps} | Target: {sft_target}° ===")
     
-    sft_loss_fn = KissingLoss(target_angle_deg=sft_target)
+    sft_threshold = math.cos(math.radians(sft_target))
+    loss_fn = KissingLoss()
+    
     model.train()
-    t0 = time.time()
     
     state = torch.randn(args.batch_size, args.num_points, args.dim, device=device)
     state = normalize_sphere(state)
     
     for step in range(args.sft_steps):
         state.requires_grad_(True)
-        loss_physics, max_cos_vec = sft_loss_fn.compute(state)
+        loss_physics, max_cos_vec = loss_fn.compute(state, threshold=sft_threshold)
         grad_sum = loss_physics.sum()
         grad_x = torch.autograd.grad(grad_sum, state)[0]
         state.requires_grad_(False)
@@ -83,7 +80,10 @@ def run_sft(rank, args, model, optimizer, device, logger):
         pred_action = dist.loc 
         
         loss_bc = torch.nn.functional.mse_loss(pred_action, target_action)
-        loss_bc += 0.0 * value.sum() + 0.0 * dist.scale.sum()
+        
+        # [Fix] 关键修改：加上 0 * value.sum()
+        # 这会让 Critic 的参数参与反向传播图（梯度为0），解决 DDP 报错 "parameters not used"
+        loss_bc += 0.0 * value.sum()
         
         optimizer.zero_grad()
         loss_bc.backward()
@@ -97,15 +97,15 @@ def run_sft(rank, args, model, optimizer, device, logger):
             state = torch.randn(args.batch_size, args.num_points, args.dim, device=device)
             state = normalize_sphere(state)
 
-        if rank == 0 and step % 200 == 0:
+        if rank == 0 and step % 100 == 0:
             avg_cos = max_cos_vec.mean().item()
             avg_deg = math.degrees(math.acos(min(avg_cos, 1.0)))
-            logger.info(f"[SFT-BC] Step {step:4d} | MSE Loss {loss_bc.item():.6f} | Physics Conf {avg_deg:.1f}°")
+            logger.info(f"[SFT] Step {step} | Loss {loss_bc.item():.5f} | Phys {avg_deg:.1f}°")
 
-    if rank == 0: logger.info(">>> SFT 完成，重置 Optimizer 并降低噪声...")
+    if rank == 0: logger.info(">>> SFT 完成，重置 Optimizer ...")
     optimizer.state.clear()
     with torch.no_grad():
-        model.module.actor_log_std.fill_(-3.0)
+        model.module.actor_log_std.fill_(-0.5)
 
 def run_solver(rank, args):
     seed = int(time.time()) + rank * 10000 
@@ -118,39 +118,41 @@ def run_solver(rank, args):
         logger = DetailedLogger(args.save_dir, rank)
         os.makedirs(os.path.join(args.save_dir, "models"), exist_ok=True)
     
-    raw_model = ActorCritic(args.dim, hidden_dim=512).to(device)
+    raw_model = ActorCritic(
+        args.dim, 
+        hidden_dim=args.hidden_dim, 
+        num_layers=args.num_layers,
+        nhead=args.nhead
+    ).to(device)
+    
     try:
         raw_model = torch.compile(raw_model)
-    except:
-        if rank == 0: print("Warning: torch.compile failed, using eager mode.")
+    except Exception as e:
+        if rank == 0: print(f"Warning: torch.compile failed: {e}")
 
+    # 不需要 find_unused_parameters=True，因为我们在 SFT 里用了 hack
     model = DDP(raw_model, device_ids=[rank], find_unused_parameters=False)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = KissingLoss()
     env = KNPEnvironment(args, device, loss_fn)
     
     # 1. SFT
-    if args.sft_steps > 0:
-        run_sft(rank, args, model, optimizer, device, logger)
+    run_sft(rank, args, model, optimizer, device, logger)
 
-    # 2. PPO Init
-    rollout_steps = 32
+    # 2. PPO Agent
+    rollout_steps = 64
     total_buffer_size = args.batch_size * rollout_steps
-    calculated_mini_batch = 4096 
-    
-    if rank == 0:
-        logger.info(f"PPO Configuration: Buffer {total_buffer_size} | MiniBatch {calculated_mini_batch}")
+    mini_batch_size = min(total_buffer_size, 8192) 
 
     agent = PPOAgent(model, optimizer, 
                     entropy_coef=0.01, 
                     ppo_epoch=4, 
-                    mini_batch_size=calculated_mini_batch)
+                    mini_batch_size=mini_batch_size)
     
     # 3. RL Loop
     curriculum_goals = list(range(25, 61, 1)) 
     curr_idx = 0
     
-    # [优化] 自动跳过过于简单的课程，从接近 SFT 目标的难度开始
     if args.sft_steps > 0:
         start_goal = max(25, args.sft_target_deg - 5.0)
         for i, g in enumerate(curriculum_goals):
@@ -168,18 +170,9 @@ def run_solver(rank, args):
     level_success = torch.tensor(0.0, device=device)
     
     if rank == 0:
-        logger.info(f"--- RL 初始目标: {curriculum_goals[curr_idx]} 度 ---")
+        logger.info(f"--- RL Start Goal: {curriculum_goals[curr_idx]} deg ---")
     
     for update_step in range(total_updates):
-        # === Warmup 判断 ===
-        is_warmup = (update_step < 100)
-        
-        if rank == 0:
-            if update_step == 0:
-                logger.info("[Warmup] Freezing Actor parameters (via Zero-Grad). Training ONLY Critic for 100 steps...")
-            elif update_step == 100:
-                logger.info("[Warmup] Warmup done. Full PPO training starts...")
-
         model.eval()
         rollouts = []
         batch_finished = torch.tensor(0.0, device=device)
@@ -215,13 +208,13 @@ def run_solver(rank, args):
                 
                 if num_success > 0 and curriculum_goals[curr_idx] >= 50:
                     success_indices = finished_indices[real_success_mask]
-                    for idx in success_indices[:3]: 
-                        refined_x, is_perfect = refine_solution(next_state[idx], loss_fn, steps=100)
+                    for idx in success_indices[:2]: 
+                        refined_x, is_perfect = refine_solution(next_state[idx], loss_fn, steps=200)
                         if is_perfect:
                             if rank == 0:
-                                logger.info(f"*** FOUND PERFECT SOLUTION (Refined) on Rank {rank}! ***")
-                            save_result(args.save_dir, f"solved_perfect_u{update_step}_r{rank}", 
-                                        refined_x.float(), args.num_points, args.dim, rank)
+                                logger.info(f"*** FOUND PERFECT SOLUTION (Rank {rank}) ***")
+                            save_result(args.save_dir, f"solved_refine_u{update_step}_r{rank}", 
+                                        refined_x, args.num_points, args.dim, rank)
 
                 env.reset_indices(finished_indices)
                 next_state[finished_indices] = env.state[finished_indices]
@@ -238,38 +231,27 @@ def run_solver(rank, args):
         
         level_finished += batch_finished
         level_success += batch_success
-        current_rate = 0.0
-        if level_finished > 0:
+        
+        if level_finished >= 10000:
             current_rate = (level_success / level_finished).item()
-            
-        required_rate = get_required_success_rate(curriculum_goals[curr_idx])
-        if level_finished >= 20000:
+            required_rate = get_required_success_rate(curriculum_goals[curr_idx])
             if current_rate >= required_rate:
                 if curr_idx < len(curriculum_goals) - 1:
                     curr_idx += 1
                     new_goal = curriculum_goals[curr_idx]
                     env.set_target_angle(new_goal)
                     if rank == 0:
-                        logger.info(f"--- LEVEL UP! {new_goal} 度 | Rate {current_rate*100:.2f}% ---")
+                        logger.info(f"--- LEVEL UP! {new_goal} deg | Rate {current_rate*100:.2f}% ---")
             level_finished.zero_()
             level_success.zero_()
         
         model.train()
-        
-        # === 调用 PPO Update (带 Warmup 参数) ===
-        # 如果 is_warmup 为 True，则 update_actor 为 False，Actor 梯度为 0
-        with torch.no_grad():
-            _, next_value = model(state)
-            next_value = next_value.squeeze(-1)
-
-        # 2. 传递 next_value 给 update 函数
-        # 注意：如果你保留了之前提到的 update_actor 参数，这里也需要根据情况传递
         loss, v_loss, entropy = agent.update(rollouts, next_value)
-        if rank == 0 and update_step % 1 == 0:
+        if rank == 0 and update_step % 2 == 0:
             std = model.module.actor_log_std.exp().mean().item()
             logger.info(
-                f"Step {update_step} | Goal {curriculum_goals[curr_idx]} | Rate {current_rate*100:.1f}% | "
-                f"ActLoss {loss:.3f} | ValLoss {v_loss:.3f} | Ent {entropy:.2f} | Std {std:.3f}"
+                f"Step {update_step} | Goal {curriculum_goals[curr_idx]} | "
+                f"Loss {loss:.3f}/{v_loss:.3f} | Ent {entropy:.3f} | Std {std:.3f}"
             )
 
     if rank == 0:
